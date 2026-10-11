@@ -1,0 +1,316 @@
+# =====================================================================
+# Banco XYZ - EFT: orquestacion completa
+#
+#   docker compose up -d --build
+#   docker compose up -d --scale ms-cuentas=3 --scale ms-pagos=2      (escalado horizontal)
+#
+# Orden de arranque (depends_on):
+#   postgres -> banco-xyz-batch (migra fin_legacy_data y TERMINA)
+#   discovery-server + config-server -> auth-server
+#   kafka + todo lo anterior -> ms-clientes, ms-cuentas, ms-pagos
+#   config + discovery + auth -> bff-web, bff-movil, bff-cajero (HTTPS 8443, 8444, 8445)
+# =====================================================================
+
+name: banco-xyz-eft
+
+# ---------- Valores comunes ----------
+
+# Los microservicios encuentran a los demas por nombre de contenedor.
+x-spring-env: &spring-env
+  SPRING_CLOUD_CONFIG_URI: http://config-server:8888
+  EUREKA_HOST: discovery-server
+  AUTH_SERVER_HOST: auth-server
+  KAFKA_SERVERS: kafka:29092
+  DB_HOST: postgres
+  DB_PORT: "5432"
+  DB_NAME: banco_xyz
+  DB_USER: ${DB_USER:-postgres}
+  DB_PASSWORD: ${DB_PASSWORD:-hola123}
+
+# Contenedores Java: reinicio automatico si fallan y limite de memoria.
+x-java-service: &java-service
+  restart: on-failure
+  networks: [banco-net]
+  deploy:
+    resources:
+      limits:
+        memory: 512M
+
+# Healthcheck: cada 10 s, hasta ~2 min de margen al arrancar.
+x-healthcheck-timing: &healthcheck-timing
+  interval: 10s
+  timeout: 5s
+  retries: 12
+  start_period: 40s
+
+# Lo que necesita un microservicio de negocio para arrancar.
+x-ms-depends: &ms-depends
+  postgres:
+    condition: service_healthy
+  banco-xyz-batch:
+    condition: service_completed_successfully
+  kafka:
+    condition: service_healthy
+  config-server:
+    condition: service_healthy
+  discovery-server:
+    condition: service_healthy
+  auth-server:
+    condition: service_healthy
+
+services:
+
+  # ------------------------------------------------------------------
+  # Infraestructura
+  # ------------------------------------------------------------------
+
+  postgres:
+    image: postgres:${POSTGRES_VERSION:-17}
+    container_name: banco-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: banco_xyz
+      POSTGRES_USER: ${DB_USER:-postgres}
+      POSTGRES_PASSWORD: ${DB_PASSWORD:-hola123}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    ports:
+      # 5433 en el host para no chocar con un PostgreSQL local en 5432
+      - "5433:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -h 127.0.0.1 -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+      start_period: 30s
+    networks: [banco-net]
+
+  # Kafka en modo KRaft (sin ZooKeeper), un broker.
+  #   - kafka:29092     -> para los contenedores
+  #   - localhost:9092  -> para correr los microservicios desde el IDE
+  kafka:
+    image: apache/kafka:4.1.2
+    container_name: banco-kafka
+    restart: unless-stopped
+    environment:
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_LISTENERS: INTERNO://:29092,EXTERNO://:9092,CONTROLLER://:9093
+      KAFKA_ADVERTISED_LISTENERS: INTERNO://kafka:29092,EXTERNO://localhost:9092
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: INTERNO:PLAINTEXT,EXTERNO:PLAINTEXT,CONTROLLER:PLAINTEXT
+      KAFKA_INTER_BROKER_LISTENER_NAME: INTERNO
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:9093
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+      # Los topicos los crea cada microservicio (TopicosConfig): 3 particiones + su -dlt
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "false"
+    ports:
+      - "9092:9092"
+    healthcheck:
+      test: ["CMD-SHELL", "/opt/kafka/bin/kafka-broker-api-versions.sh --bootstrap-server localhost:29092 > /dev/null 2>&1"]
+      interval: 10s
+      timeout: 10s
+      retries: 12
+      start_period: 20s
+    networks: [banco-net]
+
+  # Consola web de Kafka: topicos, particiones, mensajes, grupos de consumidores y lag
+  kafka-ui:
+    image: kafbat/kafka-ui:v1.2.0
+    container_name: banco-kafka-ui
+    restart: unless-stopped
+    environment:
+      KAFKA_CLUSTERS_0_NAME: banco-xyz
+      KAFKA_CLUSTERS_0_BOOTSTRAPSERVERS: kafka:29092
+    ports:
+      - "8090:8080"
+    depends_on:
+      kafka:
+        condition: service_healthy
+    networks: [banco-net]
+
+  # ------------------------------------------------------------------
+  # Parte 1: migracion batch (se ejecuta una vez y termina)
+  # ------------------------------------------------------------------
+
+  banco-xyz-batch:
+    build: ./banco-xyz-batch
+    image: banco-xyz/banco-xyz-batch
+    container_name: banco-xyz-batch
+    restart: "no"
+    environment:
+      DB_HOST: postgres
+      DB_PORT: "5432"
+      DB_NAME: banco_xyz
+      DB_USER: ${DB_USER:-postgres}
+      DB_PASSWORD: ${DB_PASSWORD:-hola123}
+    depends_on:
+      postgres:
+        condition: service_healthy
+    networks: [banco-net]
+
+  # ------------------------------------------------------------------
+  # Spring Cloud
+  # ------------------------------------------------------------------
+
+  discovery-server:
+    <<: *java-service
+    build: ./discovery-server
+    image: banco-xyz/discovery-server
+    container_name: banco-discovery-server
+    ports:
+      - "8761:8761"
+    healthcheck:
+      test: ["CMD", "curl", "-fs", "-u", "eureka:eureka2026", "http://localhost:8761/eureka/apps"]
+      <<: *healthcheck-timing
+
+  config-server:
+    <<: *java-service
+    build: ./config-server
+    image: banco-xyz/config-server
+    container_name: banco-config-server
+    volumes:
+      # Montado: un cambio en config-repo se aplica reiniciando el microservicio, sin reconstruir
+      - ./config-server/config-repo:/app/config-repo:ro
+    ports:
+      - "8888:8888"
+    healthcheck:
+      test: ["CMD", "curl", "-fs", "-u", "admin:admin", "http://localhost:8888/auth-server/default"]
+      <<: *healthcheck-timing
+
+  # ------------------------------------------------------------------
+  # Seguridad: emite los JWT (login con GitHub) y publica la clave publica
+  # ------------------------------------------------------------------
+
+  auth-server:
+    <<: *java-service
+    build: ./auth-server
+    image: banco-xyz/auth-server
+    container_name: banco-auth-server
+    environment:
+      <<: *spring-env
+      GITHUB_CLIENT_ID: ${GITHUB_CLIENT_ID:-sin-configurar}
+      GITHUB_CLIENT_SECRET: ${GITHUB_CLIENT_SECRET:-sin-configurar}
+      AUTH_OPERADORES: ${AUTH_OPERADORES:-}
+      AUTH_CLIENTES_GITHUB: ${AUTH_CLIENTES_GITHUB:-}
+      AUTH_CLIENTE_POR_DEFECTO: ${AUTH_CLIENTE_POR_DEFECTO:-1}
+    ports:
+      - "9000:9000"
+    depends_on:
+      config-server:
+        condition: service_healthy
+      discovery-server:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-fs", "http://localhost:9000/actuator/health"]
+      <<: *healthcheck-timing
+
+  # ------------------------------------------------------------------
+  # Parte 3: microservicios de negocio (escalables con --scale)
+  # Sin container_name: Docker numera las replicas (ms-cuentas-1, -2, ...).
+  # Cada replica escucha en el mismo puerto interno y se registra en Eureka
+  # con su propia IP; el host publica un rango (hasta 3 replicas por servicio).
+  # ------------------------------------------------------------------
+
+  ms-clientes:
+    <<: *java-service
+    build: ./ms-clientes
+    image: banco-xyz/ms-clientes
+    environment:
+      <<: *spring-env
+    ports:
+      - "8101-8103:8101"
+    depends_on: *ms-depends
+    healthcheck:
+      test: ["CMD", "curl", "-fs", "http://localhost:8101/actuator/health"]
+      <<: *healthcheck-timing
+
+  ms-cuentas:
+    <<: *java-service
+    build: ./ms-cuentas
+    image: banco-xyz/ms-cuentas
+    environment:
+      <<: *spring-env
+    ports:
+      - "8201-8203:8201"
+    depends_on: *ms-depends
+    healthcheck:
+      test: ["CMD", "curl", "-fs", "http://localhost:8201/actuator/health"]
+      <<: *healthcheck-timing
+
+  ms-pagos:
+    <<: *java-service
+    build: ./ms-pagos
+    image: banco-xyz/ms-pagos
+    environment:
+      <<: *spring-env
+    ports:
+      - "8301-8303:8301"
+    depends_on: *ms-depends
+    healthcheck:
+      test: ["CMD", "curl", "-fs", "http://localhost:8301/actuator/health"]
+      <<: *healthcheck-timing
+
+  # ------------------------------------------------------------------
+  # Parte 2: Backend for Frontend, uno por canal (independientes, HTTPS)
+  # ------------------------------------------------------------------
+
+  bff-web:
+    <<: *java-service
+    build: ./bff-web
+    image: banco-xyz/bff-web
+    container_name: banco-bff-web
+    environment:
+      <<: *spring-env
+    ports:
+      - "8443:8443"
+    depends_on: &bff-depends
+      config-server:
+        condition: service_healthy
+      discovery-server:
+        condition: service_healthy
+      auth-server:
+        condition: service_healthy
+    healthcheck:
+      # actuator en un puerto interno HTTP (el puerto publico es HTTPS)
+      test: ["CMD", "curl", "-fs", "http://localhost:9443/actuator/health"]
+      <<: *healthcheck-timing
+
+  bff-movil:
+    <<: *java-service
+    build: ./bff-movil
+    image: banco-xyz/bff-movil
+    container_name: banco-bff-movil
+    environment:
+      <<: *spring-env
+    ports:
+      - "8444:8444"
+    depends_on: *bff-depends
+    healthcheck:
+      test: ["CMD", "curl", "-fs", "http://localhost:9444/actuator/health"]
+      <<: *healthcheck-timing
+
+  bff-cajero:
+    <<: *java-service
+    build: ./bff-cajero
+    image: banco-xyz/bff-cajero
+    container_name: banco-bff-cajero
+    environment:
+      <<: *spring-env
+    ports:
+      - "8445:8445"     # HTTPS con certificado de cliente obligatorio (mTLS)
+    depends_on: *bff-depends
+    healthcheck:
+      test: ["CMD", "curl", "-fs", "http://localhost:9445/actuator/health"]
+      <<: *healthcheck-timing
+
+networks:
+  banco-net:
+    name: banco-net-eft
+
+volumes:
+  pgdata:
+    name: banco-xyz-eft-pgdata

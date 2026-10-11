@@ -1,0 +1,9 @@
+# No enviar al contexto de build lo que no se necesita para compilar
+target/
+.idea/
+.vscode/
+*.iml
+.mvn/
+mvnw
+mvnw.cmd
+HELP.md

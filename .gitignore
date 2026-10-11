@@ -1,0 +1,16 @@
+target/
+.vscode/
+.idea/
+*.iml
+.mvn/wrapper/maven-wrapper.jar
+
+# Semana 8: secretos locales
+# Se versiona solo .env.example como plantilla.
+.env
+
+# Salidas locales del batch
+banco-xyz-batch/salida/
+*.log
+
+# Claves privadas de las CA de desarrollo (se regeneran con certificados/generar-certificados.sh)
+certificados/ca/*.key
